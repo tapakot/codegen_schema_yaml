@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+def load_manifest(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_models(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {
+        unique_id: node
+        for unique_id, node in manifest.get("nodes", {}).items()
+        if node.get("resource_type") == "model"
+    }
+
+
+def escape_dbml_string(value: str) -> str:
+    """
+    Escape string for DBML single-quoted string.
+    """
+    if value is None:
+        return ""
+
+    return str(value).replace("\\", "\\\\").replace("'", "\\'").strip()
+
+
+def escape_dbml_identifier(name: str) -> str:
+    """
+    Quote DBML identifier if necessary.
+    """
+    if not name:
+        return '""'
+
+    safe_chars = set(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789_"
+    )
+
+    if all(c in safe_chars for c in name):
+        return name
+
+    return f'"{name}"'
+
+
+def sql_type_to_dbml(data_type: Optional[str]) -> str:
+    """
+    Keep the original warehouse/dbt data type.
+
+    DBML accepts most SQL-like type names.
+    """
+    if not data_type:
+        return "varchar"
+
+    return data_type
+
+
+def get_primary_keys(model: Dict[str, Any]) -> List[str]:
+    """
+    Read:
+
+        meta:
+          primary_key:
+            - column1
+            - column2
+    """
+    meta = model.get("meta") or {}
+    primary_key = meta.get("primary_key")
+
+    if not primary_key:
+        return []
+
+    if isinstance(primary_key, str):
+        return [primary_key]
+
+    if isinstance(primary_key, list):
+        return primary_key
+
+    raise ValueError(
+        f"Invalid primary_key definition "
+        f"for model '{model.get('name')}': {primary_key!r}"
+    )
+
+
+def get_data_vault_type(model: Dict[str, Any]) -> Optional[str]:
+    """
+    Read:
+
+        meta:
+          type: hub
+    """
+    meta = model.get("meta") or {}
+
+    return meta.get("type")
+
+
+def get_foreign_keys(model: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Read FK definitions:
+
+        columns:
+          - name: order_hk
+            meta:
+              data_vault:
+                role: foreign_key
+                references:
+                  model: hub_order
+                  column: order_hk
+    """
+    result = []
+
+    for column in model.get("columns", {}).values():
+        column_name = column.get("name")
+
+        column_meta = column.get("meta") or {}
+        data_vault = column_meta.get("data_vault") or {}
+
+        if data_vault.get("role") != "foreign_key":
+            continue
+
+        references = data_vault.get("references") or {}
+
+        target_model = references.get("model")
+        target_column = references.get("column")
+
+        if not target_model or not target_column:
+            raise ValueError(
+                f"Invalid FK definition: "
+                f"{model.get('name')}.{column_name}. "
+                f"Expected references.model and references.column."
+            )
+
+        result.append(
+            {
+                "source_column": column_name,
+                "target_model": target_model,
+                "target_column": target_column,
+            }
+        )
+
+    return result
+
+
+def generate_column_note(column: Dict[str, Any]) -> Optional[str]:
+    """
+    Generate a DBML inline column note from dbt column description.
+
+    Example:
+
+        customer_hk varchar [pk, note: 'Hash key of customer']
+    """
+    description = column.get("description")
+
+    if not description:
+        return None
+
+    description = escape_dbml_string(description)
+
+    return f"note: '{description}'"
+
+
+def generate_table(model: Dict[str, Any]) -> str:
+    """
+    Generate a DBML Table block.
+
+    Model description becomes a table Note.
+    Column descriptions become column notes.
+    """
+    model_name = model["name"]
+
+    columns = model.get("columns", {})
+    primary_keys = set(get_primary_keys(model))
+
+    lines = [
+        f"Table {escape_dbml_identifier(model_name)} {{"
+    ]
+
+    for column in columns.values():
+        column_name = column["name"]
+
+        data_type = sql_type_to_dbml(
+            column.get("data_type")
+        )
+
+        attributes = []
+
+        if column_name in primary_keys:
+            attributes.append("pk")
+
+        column_note = generate_column_note(column)
+
+        if column_note:
+            attributes.append(column_note)
+
+        attributes_text = ""
+
+        if attributes:
+            attributes_text = f" [{', '.join(attributes)}]"
+
+        lines.append(
+            f"  {escape_dbml_identifier(column_name)} "
+            f"{data_type}{attributes_text}"
+        )
+
+    # Model-level description
+    description = model.get("description")
+
+    if description:
+        description = escape_dbml_string(description)
+
+        lines.append("")
+        lines.append(
+            f"  Note: '{description}'"
+        )
+
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+def generate_ref(
+    source_model: Dict[str, Any],
+    foreign_key: Dict[str, str],
+) -> str:
+    """
+    Generate:
+
+        Ref: source.column > target.column
+    """
+    source_table = source_model["name"]
+    source_column = foreign_key["source_column"]
+
+    target_table = foreign_key["target_model"]
+    target_column = foreign_key["target_column"]
+
+    return (
+        f"Ref: "
+        f"{escape_dbml_identifier(source_table)}."
+        f"{escape_dbml_identifier(source_column)} "
+        f"> "
+        f"{escape_dbml_identifier(target_table)}."
+        f"{escape_dbml_identifier(target_column)}"
+    )
+
+
+def generate_table_groups(
+    models: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    """
+    Generate DBML TableGroup blocks based on:
+
+        meta:
+          data_vault:
+            type: hub | link | satellite | ...
+
+    Example:
+
+        TableGroup "Hubs" {
+          hub_customer
+          hub_order
+        }
+    """
+
+    groups: Dict[str, List[str]] = {}
+
+    for model in models.values():
+        data_vault_type = get_data_vault_type(model)
+
+        if not data_vault_type:
+            continue
+
+        model_name = model["name"]
+
+        groups.setdefault(
+            data_vault_type,
+            []
+        ).append(model_name)
+
+    result = []
+
+    for data_vault_type, model_names in sorted(groups.items()):
+        # Pretty display name:
+        #
+        # hub       -> Hubs
+        # link      -> Links
+        # satellite -> Satellites
+        #
+        # For unknown types:
+        # effectivity_satellite -> Effectivity Satellites
+        group_name = data_vault_type.replace("_", " ").title()
+
+        if not group_name.endswith("s"):
+            group_name += "s"
+
+        lines = [
+            f'TableGroup "{escape_dbml_string(group_name)}" {{'
+        ]
+
+        for model_name in sorted(model_names):
+            lines.append(
+                f"  {escape_dbml_identifier(model_name)}"
+            )
+
+        lines.append("}")
+
+        result.append(
+            "\n".join(lines)
+        )
+
+    return result
+
+
+def generate_dbml(
+    manifest: Dict[str, Any],
+    only_data_vault: bool = False,
+) -> str:
+
+    all_models = get_models(manifest)
+
+    # Filter models if requested
+    if only_data_vault:
+        models = {
+            unique_id: model
+            for unique_id, model in all_models.items()
+            if get_data_vault_type(model)
+        }
+    else:
+        models = all_models
+
+    tables = []
+    refs = []
+
+    # ---------------------------------------------------------
+    # Tables
+    # ---------------------------------------------------------
+
+    for model in sorted(
+        models.values(),
+        key=lambda x: x["name"]
+    ):
+        tables.append(
+            generate_table(model)
+        )
+
+    # ---------------------------------------------------------
+    # References
+    # ---------------------------------------------------------
+
+    for model in sorted(
+        models.values(),
+        key=lambda x: x["name"]
+    ):
+        foreign_keys = get_foreign_keys(model)
+
+        for foreign_key in foreign_keys:
+
+            target_model_name = foreign_key["target_model"]
+
+            # Check that target model exists
+            target_exists = any(
+                m["name"] == target_model_name
+                for m in all_models.values()
+            )
+
+            if not target_exists:
+                raise ValueError(
+                    f"Model '{model['name']}' references "
+                    f"unknown model '{target_model_name}'"
+                )
+
+            refs.append(
+                generate_ref(
+                    model,
+                    foreign_key,
+                )
+            )
+
+    # ---------------------------------------------------------
+    # Table groups
+    # ---------------------------------------------------------
+
+    groups = generate_table_groups(models)
+
+    # ---------------------------------------------------------
+    # Assemble DBML
+    # ---------------------------------------------------------
+
+    sections = []
+
+    if tables:
+        sections.append(
+            "\n\n\n".join(tables)
+        )
+
+    if refs:
+        sections.append(
+            "\n".join(refs)
+        )
+
+    if groups:
+        sections.append(
+            "\n\n\n".join(groups)
+        )
+
+    return "\n\n\n".join(sections)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert dbt manifest.json to DBML"
+    )
+
+    parser.add_argument(
+        "--manifest",
+        default="target/manifest.json",
+        help="Path to dbt manifest.json",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="database.dbml",
+        help="Output DBML file",
+    )
+
+    parser.add_argument(
+        "--only-data-vault",
+        action="store_true",
+        help="Include only models containing meta.data_vault",
+    )
+
+    args = parser.parse_args()
+
+    manifest = load_manifest(args.manifest)
+
+    dbml = generate_dbml(
+        manifest,
+        only_data_vault=args.only_data_vault,
+    )
+
+    Path(args.output).write_text(
+        dbml,
+        encoding="utf-8",
+    )
+
+    print(f"DBML written to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
